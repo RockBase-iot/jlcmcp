@@ -6,6 +6,9 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsx watch src/index.ts",
+    "relay": "node relay.js",
+    "serve": "node relay.js",
+    "mcp": "node dist/index.js",
     "start": "node dist/index.js"
   },
   "dependencies": {

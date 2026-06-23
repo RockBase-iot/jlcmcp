@@ -2,7 +2,12 @@ import * as extensionConfig from '../extension.json';
 
 const APP_NAME = String((extensionConfig as any).displayName || 'JLC Bridge');
 const APP_VERSION = String((extensionConfig as any).version || '0.0.0');
-const BRIDGE_DIR = 'C:\\Users\\0\\.openclaw\\workspace\\jlc-bridge';
+const RUNTIME_ENV = (globalThis as any)?.process?.env ?? {};
+const USER_HOME = String(RUNTIME_ENV.USERPROFILE || RUNTIME_ENV.HOME || '').trim();
+const BRIDGE_DIR = String(
+  RUNTIME_ENV.JLC_BRIDGE_DIR ||
+  (USER_HOME ? `${USER_HOME}\\.openclaw\\workspace\\jlc-bridge` : '.openclaw\\workspace\\jlc-bridge'),
+);
 const COMMAND_FILE = `${BRIDGE_DIR}\\command.json`;
 const RESULT_FILE = `${BRIDGE_DIR}\\result.json`;
 const LOG_FILE = `${BRIDGE_DIR}\\bridge.log`;
@@ -41,6 +46,59 @@ type BridgeResult = {
 
 function anyEda(): any {
   return eda as any;
+}
+
+function isPlainObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+async function safeCall<T>(fn: () => T | Promise<T>): Promise<T | undefined> {
+  try {
+    return await Promise.resolve(fn());
+  } catch {
+    return undefined;
+  }
+}
+
+function toSerializable(value: any, depth = 0): any {
+  if (value === null || value === undefined) return value;
+  if (depth > 4) return String(value);
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+  if (Array.isArray(value)) return value.slice(0, 200).map((item) => toSerializable(item, depth + 1));
+  if (typeof value !== 'object') return String(value);
+
+  const output: Record<string, any> = {};
+  for (const key of Object.keys(value).slice(0, 120)) {
+    if (key.startsWith('_')) continue;
+    const item = value[key];
+    if (typeof item === 'function') continue;
+    output[key] = toSerializable(item, depth + 1);
+  }
+
+  const getterNames = [
+    'getState_PrimitiveId',
+    'getState_Designator',
+    'getState_Name',
+    'getState_Value',
+    'getState_Net',
+    'getState_NetName',
+    'getState_X',
+    'getState_Y',
+    'getState_PinNumber',
+    'getState_PinName',
+    'getState_Number',
+  ];
+  for (const getterName of getterNames) {
+    try {
+      const getter = value?.[getterName];
+      if (typeof getter !== 'function') continue;
+      output[getterName.replace(/^getState_/, '')] = toSerializable(getter.call(value), depth + 1);
+    } catch {
+      // ignore getter failures
+    }
+  }
+
+  return output;
 }
 
 function hasLegacyFileApi(): boolean {
@@ -1700,6 +1758,222 @@ async function openDocument(params: { uuid: string }): Promise<any> {
   return { opened: uuid };
 }
 
+async function getEdaContext(params: { scope?: string }): Promise<any> {
+  const api = anyEda();
+  return {
+    scope: String(params?.scope || ''),
+    capturedAt: new Date().toISOString(),
+    bridge: {
+      name: APP_NAME,
+      version: APP_VERSION,
+      transport: wsConnected ? 'WebSocket' : (bridgeEnabled ? `file polling (${getTimerMode()})` : 'none'),
+    },
+    currentDocumentInfo: toSerializable(await safeCall(() => api?.dmt_SelectControl?.getCurrentDocumentInfo?.())),
+    currentProjectInfo: toSerializable(await safeCall(() => api?.dmt_Project?.getCurrentProjectInfo?.())),
+    currentBoardInfo: toSerializable(await safeCall(() => api?.dmt_Board?.getCurrentBoardInfo?.())),
+    currentSchematicInfo: toSerializable(await safeCall(() => api?.dmt_Schematic?.getCurrentSchematicInfo?.())),
+    currentSchematicPageInfo: toSerializable(await safeCall(() => api?.dmt_Schematic?.getCurrentSchematicPageInfo?.())),
+    currentPcbInfo: toSerializable(await safeCall(() => api?.dmt_Pcb?.getCurrentPcbInfo?.())),
+    selectedPcbPrimitiveIds: toSerializable(await safeCall(() => api?.pcb_SelectControl?.getAllSelectedPrimitives_PrimitiveId?.()) || []),
+    selectedSchPrimitiveIds: toSerializable(await safeCall(() => api?.sch_SelectControl?.getAllSelectedPrimitives_PrimitiveId?.()) || []),
+  };
+}
+
+const FORBIDDEN_API_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
+
+function resolveApiSegment(target: Record<string, unknown>, segment: string): string {
+  if (segment in target) return segment;
+  const lower = segment.toLowerCase();
+  for (const key of Object.keys(target)) {
+    if (key.toLowerCase() === lower) return key;
+  }
+  throw new Error(`API path segment not found: ${segment}`);
+}
+
+async function invokeEdaApi(params: { apiFullName?: string; args?: unknown[] }): Promise<any> {
+  const apiFullName = String(params?.apiFullName || '').trim();
+  if (!apiFullName) throw new Error('apiFullName is required');
+  const segments = apiFullName.split('.');
+  if (segments.length < 3 || segments[0].toLowerCase() !== 'eda' || segments.some((item) => !item)) {
+    throw new Error('apiFullName must look like eda.module.method');
+  }
+  if (segments.some((item) => FORBIDDEN_API_PATH_SEGMENTS.has(item))) {
+    throw new Error('apiFullName contains a forbidden path segment');
+  }
+
+  let current: unknown = anyEda();
+  for (let index = 1; index < segments.length - 1; index += 1) {
+    if (!isPlainObjectRecord(current)) throw new Error(`Invalid API path: ${apiFullName}`);
+    current = current[resolveApiSegment(current, segments[index])];
+  }
+  if (!isPlainObjectRecord(current)) throw new Error(`Invalid API target: ${apiFullName}`);
+  const methodKey = resolveApiSegment(current, segments[segments.length - 1]);
+  const callable = current[methodKey];
+  if (typeof callable !== 'function') throw new Error(`API target is not callable: ${apiFullName}`);
+
+  const args = Array.isArray(params?.args) ? params.args : [];
+  const result = await Promise.resolve(callable.apply(current, args));
+  return {
+    apiFullName,
+    argsCount: args.length,
+    result: toSerializable(result),
+  };
+}
+
+function normalizeSchematicComponent(row: any): any {
+  return {
+    primitiveId: readFirstStringValue(row, ['getState_PrimitiveId']),
+    designator: readFirstStringValue(row, ['getState_Designator']),
+    name: readFirstStringValue(row, ['getState_Name', 'getState_DisplayName']),
+    value: readFirstStringValue(row, ['getState_Value']),
+    x: toFinite(readFirstNumberValue(row, ['getState_X']), 0),
+    y: toFinite(readFirstNumberValue(row, ['getState_Y']), 0),
+    rotation: toFinite(readFirstNumberValue(row, ['getState_Rotation']), 0),
+    component: {
+      libraryUuid: readFirstStringValue(row, ['getState_LibraryUuid', 'getState_ComponentLibraryUuid']),
+      uuid: readFirstStringValue(row, ['getState_Uuid', 'getState_ComponentUuid']),
+    },
+  };
+}
+
+function normalizeSchematicPin(pin: any): any {
+  return {
+    primitiveId: readFirstStringValue(pin, ['getState_PrimitiveId']),
+    pinNumber: readFirstStringValue(pin, ['getState_PinNumber', 'getState_Number']),
+    pinName: readFirstStringValue(pin, ['getState_PinName', 'getState_Name']),
+    net: readFirstStringValue(pin, ['getState_Net', 'getState_NetName']),
+    x: toFinite(readFirstNumberValue(pin, ['getState_X']), 0),
+    y: toFinite(readFirstNumberValue(pin, ['getState_Y']), 0),
+    raw: toSerializable(pin),
+  };
+}
+
+function normalizeSchematicWire(row: any): any {
+  return {
+    primitiveId: readFirstStringValue(row, ['getState_PrimitiveId']),
+    net: readFirstStringValue(row, ['getState_Net', 'getState_NetName']),
+    line: toSerializable(row?.getState_Line?.()),
+  };
+}
+
+async function getSchematicComponentPins(params: { primitiveId: string }): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_PrimitiveComponent?.getAllPinsByPrimitiveId) {
+    throw new Error('current EDA does not support sch_PrimitiveComponent.getAllPinsByPrimitiveId');
+  }
+  const primitiveId = String(params?.primitiveId || '').trim();
+  if (!primitiveId) throw new Error('primitiveId is required');
+  const rows = await api.sch_PrimitiveComponent.getAllPinsByPrimitiveId(primitiveId);
+  const pins = (Array.isArray(rows) ? rows : []).map(normalizeSchematicPin);
+  return { primitiveId, pins, count: pins.length };
+}
+
+async function readSchematic(): Promise<any> {
+  const api = anyEda();
+  const state = await getSchematicState();
+  const components = state.components || [];
+  const componentPins: Record<string, any[]> = {};
+  for (const component of components) {
+    if (!component.primitiveId || !api?.sch_PrimitiveComponent?.getAllPinsByPrimitiveId) continue;
+    const pinsResult = await safeCall(() => getSchematicComponentPins({ primitiveId: component.primitiveId }));
+    componentPins[component.primitiveId] = Array.isArray((pinsResult as any)?.pins) ? (pinsResult as any).pins : [];
+  }
+
+  const netMap: Record<string, Array<{ component?: string; pinNumber?: string; pinName?: string; primitiveId?: string }>> = {};
+  for (const component of components) {
+    for (const pin of componentPins[component.primitiveId] || []) {
+      const net = String(pin.net || '').trim();
+      if (!net) continue;
+      if (!netMap[net]) netMap[net] = [];
+      netMap[net].push({
+        component: component.designator || component.name,
+        pinNumber: pin.pinNumber,
+        pinName: pin.pinName,
+        primitiveId: pin.primitiveId,
+      });
+    }
+  }
+
+  return {
+    context: await getEdaContext({ scope: 'schematic_read' }),
+    components,
+    componentPins,
+    nets: Object.entries(netMap).map(([net, connections]) => ({ net, connections, count: connections.length })),
+    wires: state.wires || [],
+    drc: await safeCall(() => runSchDrc({ strict: false })),
+  };
+}
+
+async function reviewSchematic(): Promise<any> {
+  const api = anyEda();
+  const context = await getEdaContext({ scope: 'schematic_review' });
+  const schematics = toSerializable(await safeCall(() => api?.dmt_Schematic?.getAllSchematicsInfo?.()) || []);
+  const pages = toSerializable(await safeCall(() => api?.dmt_Schematic?.getAllSchematicPagesInfo?.()) || []);
+  const snapshot = await readSchematic();
+  const bomFile = await safeCall(() => api?.sch_ManufactureData?.getBomFile?.());
+  const netlistFile = await safeCall(() => api?.sch_ManufactureData?.getNetlistFile?.());
+  return {
+    context,
+    schematics,
+    pages,
+    currentPageSnapshot: snapshot,
+    manufactureData: {
+      bomFile: toSerializable(bomFile),
+      netlistFile: toSerializable(netlistFile),
+    },
+  };
+}
+
+async function saveSchematic(): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_Document?.save) {
+    throw new Error('current EDA does not support sch_Document.save');
+  }
+  const saved = await api.sch_Document.save();
+  return { saved: Boolean(saved) };
+}
+
+async function clearSchematicPage(params: {
+  includeComponents?: boolean;
+  includeWires?: boolean;
+  includeText?: boolean;
+}): Promise<any> {
+  const api = anyEda();
+  const includeComponents = params?.includeComponents !== false;
+  const includeWires = params?.includeWires !== false;
+  const includeText = params?.includeText !== false;
+  const deleted: Record<string, number> = { components: 0, wires: 0, text: 0 };
+
+  if (includeWires && api?.sch_PrimitiveWire?.getAll && api?.sch_PrimitiveWire?.delete) {
+    const rows = await api.sch_PrimitiveWire.getAll();
+    const ids = (Array.isArray(rows) ? rows : []).map((row: any) => readFirstStringValue(row, ['getState_PrimitiveId'])).filter(Boolean);
+    if (ids.length) {
+      await api.sch_PrimitiveWire.delete(ids);
+      deleted.wires = ids.length;
+    }
+  }
+
+  if (includeText && api?.sch_PrimitiveText?.getAll && api?.sch_PrimitiveText?.delete) {
+    const rows = await api.sch_PrimitiveText.getAll();
+    const ids = (Array.isArray(rows) ? rows : []).map((row: any) => readFirstStringValue(row, ['getState_PrimitiveId'])).filter(Boolean);
+    if (ids.length) {
+      await api.sch_PrimitiveText.delete(ids);
+      deleted.text = ids.length;
+    }
+  }
+
+  if (includeComponents && api?.sch_PrimitiveComponent?.getAll && api?.sch_PrimitiveComponent?.delete) {
+    const rows = await api.sch_PrimitiveComponent.getAll();
+    const ids = (Array.isArray(rows) ? rows : []).map((row: any) => readFirstStringValue(row, ['getState_PrimitiveId'])).filter(Boolean);
+    if (ids.length) {
+      await api.sch_PrimitiveComponent.delete(ids);
+      deleted.components = ids.length;
+    }
+  }
+
+  return { deleted };
+}
+
 async function getSchematicState(): Promise<any> {
   const api = anyEda();
   if (!api?.sch_PrimitiveComponent?.getAll) {
@@ -1708,30 +1982,14 @@ async function getSchematicState(): Promise<any> {
 
   // Read all components across all schematic pages
   const rows = await api.sch_PrimitiveComponent.getAll(undefined, true);
-  const components = (Array.isArray(rows) ? rows : []).map((r: any) => ({
-    primitiveId: r?.getState_PrimitiveId?.() || '',
-    designator: r?.getState_Designator?.() || '',
-    name: r?.getState_Name?.() || r?.getState_DisplayName?.() || '',
-    value: r?.getState_Value?.() || '',
-    component: {
-      libraryUuid: r?.getState_LibraryUuid?.() || r?.getState_ComponentLibraryUuid?.() || '',
-      uuid: r?.getState_Uuid?.() || r?.getState_ComponentUuid?.() || '',
-    },
-  })).filter((c: any) => c.primitiveId);
+  const components = (Array.isArray(rows) ? rows : []).map(normalizeSchematicComponent).filter((c: any) => c.primitiveId);
 
   // Read pins
   let pins: any[] = [];
   if (api?.sch_PrimitivePin?.getAll) {
     try {
       const pinRows = await api.sch_PrimitivePin.getAll();
-      pins = (Array.isArray(pinRows) ? pinRows : []).map((p: any) => ({
-        primitiveId: p?.getState_PrimitiveId?.() || '',
-        pinNumber: p?.getState_PinNumber?.() || p?.getState_Number?.() || '',
-        pinName: p?.getState_PinName?.() || p?.getState_Name?.() || '',
-        net: p?.getState_Net?.() || p?.getState_NetName?.() || '',
-        x: Number(p?.getState_X?.() ?? 0),
-        y: Number(p?.getState_Y?.() ?? 0),
-      })).filter((p: any) => p.primitiveId);
+      pins = (Array.isArray(pinRows) ? pinRows : []).map(normalizeSchematicPin).filter((p: any) => p.primitiveId);
     } catch { /* ignore */ }
   }
 
@@ -1740,10 +1998,7 @@ async function getSchematicState(): Promise<any> {
   if (api?.sch_PrimitiveWire?.getAll) {
     try {
       const wireRows = await api.sch_PrimitiveWire.getAll();
-      wires = (Array.isArray(wireRows) ? wireRows : []).map((w: any) => ({
-        primitiveId: w?.getState_PrimitiveId?.() || '',
-        net: w?.getState_Net?.() || w?.getState_NetName?.() || '',
-      })).filter((w: any) => w.primitiveId);
+      wires = (Array.isArray(wireRows) ? wireRows : []).map(normalizeSchematicWire).filter((w: any) => w.primitiveId);
     } catch { /* ignore */ }
   }
 
@@ -1767,6 +2022,238 @@ async function runSchDrc(params: { strict?: boolean }): Promise<any> {
   const strict = params?.strict !== false;
   const result = await api.sch_Drc.check(strict, false);
   return { passed: Boolean(result) };
+}
+
+function libraryItemSummary(item: any): any {
+  return {
+    uuid: String(item?.uuid || item?.deviceUuid || item?.symbolUuid || ''),
+    libraryUuid: String(item?.libraryUuid || item?.library?.uuid || ''),
+    name: String(item?.name || item?.title || item?.displayName || ''),
+    displayName: String(item?.displayName || item?.title || item?.name || ''),
+    description: String(item?.description || ''),
+    lcscId: String(item?.lcscId || item?.supplierId || item?.supplierPartNumber || item?.cNumber || ''),
+    manufacturer: String(item?.manufacturer || ''),
+    manufacturerId: String(item?.manufacturerId || item?.mpn || ''),
+    package: String(item?.package || item?.footprintName || item?.footprint || ''),
+    raw: item,
+  };
+}
+
+async function searchLibraryDevices(params: {
+  keyword: string;
+  libraryUuid?: string;
+  itemsOfPage?: number;
+  page?: number;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.lib_Device?.search) {
+    throw new Error('current EDA does not support lib_Device.search');
+  }
+  const keyword = String(params.keyword || '').trim();
+  if (!keyword) throw new Error('keyword is required');
+  const rows = await api.lib_Device.search(
+    keyword,
+    params.libraryUuid,
+    undefined,
+    undefined,
+    params.itemsOfPage ?? 10,
+    params.page ?? 1,
+  );
+  const devices = (Array.isArray(rows) ? rows : []).map(libraryItemSummary);
+  return { keyword, devices, count: devices.length };
+}
+
+async function getLibraryDevicesByLcsc(params: {
+  lcscIds: string | string[];
+  libraryUuid?: string;
+  allowMultiMatch?: boolean;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.lib_Device?.getByLcscIds) {
+    throw new Error('current EDA does not support lib_Device.getByLcscIds');
+  }
+  const result = await api.lib_Device.getByLcscIds(
+    params.lcscIds,
+    params.libraryUuid,
+    params.allowMultiMatch,
+  );
+  const devices = Array.isArray(result) ? result.map(libraryItemSummary) : (result ? [libraryItemSummary(result)] : []);
+  return { lcscIds: params.lcscIds, devices, count: devices.length };
+}
+
+function schematicPrimitiveSummary(result: any): any {
+  if (!result) return {};
+  return {
+    primitiveId: result?.getState_PrimitiveId?.() || result?.primitiveId || '',
+    designator: result?.getState_Designator?.() || result?.designator || '',
+    name: result?.getState_Name?.() || result?.getState_DisplayName?.() || result?.name || '',
+    net: result?.getState_Net?.() || result?.getState_NetName?.() || result?.net || '',
+    x: Number(result?.getState_X?.() ?? result?.x ?? 0),
+    y: Number(result?.getState_Y?.() ?? result?.y ?? 0),
+  };
+}
+
+async function createSchematicComponent(params: {
+  component: { libraryUuid: string; uuid: string };
+  x: number;
+  y: number;
+  subPartName?: string;
+  rotation?: number;
+  mirror?: boolean;
+  addIntoBom?: boolean;
+  addIntoPcb?: boolean;
+  designator?: string;
+  name?: string;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_PrimitiveComponent?.create) {
+    throw new Error('current EDA does not support sch_PrimitiveComponent.create');
+  }
+  const { component, x, y, subPartName, rotation, mirror, addIntoBom, addIntoPcb, designator, name } = params;
+  if (!component?.libraryUuid || !component?.uuid) {
+    throw new Error('component.libraryUuid and component.uuid are required');
+  }
+  const result = await api.sch_PrimitiveComponent.create(
+    { libraryUuid: component.libraryUuid, uuid: component.uuid },
+    Number(x),
+    Number(y),
+    subPartName,
+    rotation ?? 0,
+    Boolean(mirror),
+    addIntoBom,
+    addIntoPcb,
+  );
+  if (!result) throw new Error('failed to create schematic component');
+
+  const primitiveId = result?.getState_PrimitiveId?.() || result?.primitiveId || '';
+  if ((designator || name) && api?.sch_PrimitiveComponent?.modify && primitiveId) {
+    try {
+      await api.sch_PrimitiveComponent.modify(result, {
+        designator: designator || undefined,
+        name: name || undefined,
+      });
+    } catch {
+      // Some component kinds do not allow property edits immediately after creation.
+    }
+  }
+
+  return schematicPrimitiveSummary(result);
+}
+
+async function createSchematicWire(params: {
+  line: number[] | number[][];
+  net?: string;
+  color?: string | null;
+  lineWidth?: number | null;
+  lineType?: any;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_PrimitiveWire?.create) {
+    throw new Error('current EDA does not support sch_PrimitiveWire.create');
+  }
+  const { line, net, color, lineWidth, lineType } = params;
+  if (!Array.isArray(line) || line.length < 4) {
+    throw new Error('line must be a coordinate array, e.g. [x1,y1,x2,y2]');
+  }
+  const result = await api.sch_PrimitiveWire.create(
+    line,
+    net,
+    color ?? null,
+    lineWidth ?? null,
+    lineType ?? null,
+  );
+  if (!result) throw new Error('failed to create schematic wire');
+  return schematicPrimitiveSummary(result);
+}
+
+async function createSchematicNetFlag(params: {
+  identification: 'Power' | 'Ground' | 'AnalogGround' | 'ProtectGround';
+  net: string;
+  x: number;
+  y: number;
+  rotation?: number;
+  mirror?: boolean;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_PrimitiveComponent?.createNetFlag) {
+    throw new Error('current EDA does not support sch_PrimitiveComponent.createNetFlag');
+  }
+  const identification = String(params.identification || 'Power') as any;
+  const net = String(params.net || '').trim();
+  if (!net) throw new Error('net is required');
+  const result = await api.sch_PrimitiveComponent.createNetFlag(
+    identification,
+    net,
+    Number(params.x),
+    Number(params.y),
+    params.rotation ?? 0,
+    Boolean(params.mirror),
+  );
+  if (!result) throw new Error('failed to create schematic net flag');
+  return schematicPrimitiveSummary(result);
+}
+
+async function createSchematicNetPort(params: {
+  direction: 'IN' | 'OUT' | 'BI';
+  net: string;
+  x: number;
+  y: number;
+  rotation?: number;
+  mirror?: boolean;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_PrimitiveComponent?.createNetPort) {
+    throw new Error('current EDA does not support sch_PrimitiveComponent.createNetPort');
+  }
+  const direction = String(params.direction || 'BI') as any;
+  const net = String(params.net || '').trim();
+  if (!net) throw new Error('net is required');
+  const result = await api.sch_PrimitiveComponent.createNetPort(
+    direction,
+    net,
+    Number(params.x),
+    Number(params.y),
+    params.rotation ?? 0,
+    Boolean(params.mirror),
+  );
+  if (!result) throw new Error('failed to create schematic net port');
+  return schematicPrimitiveSummary(result);
+}
+
+async function createSchematicText(params: {
+  x: number;
+  y: number;
+  content: string;
+  rotation?: number;
+  textColor?: string | null;
+  fontName?: string | null;
+  fontSize?: number | null;
+  bold?: boolean;
+  italic?: boolean;
+  underLine?: boolean;
+  alignMode?: number;
+}): Promise<any> {
+  const api = anyEda();
+  if (!api?.sch_PrimitiveText?.create) {
+    throw new Error('current EDA does not support sch_PrimitiveText.create');
+  }
+  const content = String(params.content || '').trim();
+  if (!content) throw new Error('content is required');
+  const result = await api.sch_PrimitiveText.create(
+    Number(params.x),
+    Number(params.y),
+    content,
+    params.rotation ?? 0,
+    params.textColor ?? null,
+    params.fontName ?? null,
+    params.fontSize ?? null,
+    Boolean(params.bold),
+    Boolean(params.italic),
+    Boolean(params.underLine),
+    params.alignMode,
+  );
+  if (!result) throw new Error('failed to create schematic text');
+  return schematicPrimitiveSummary(result);
 }
 
 async function createPcbComponent(params: {
@@ -1826,12 +2313,26 @@ async function getFeatureSupport(): Promise<any> {
       padPairGroup: Boolean(api?.pcb_Drc?.createPadPairGroup),
     },
     schematic: {
+      context: Boolean(api?.dmt_SelectControl?.getCurrentDocumentInfo),
+      apiInvoke: true,
       getBoardInfo: Boolean(api?.dmt_Board?.getCurrentBoardInfo),
       openDocument: Boolean(api?.dmt_EditorControl?.openDocument),
       getComponents: Boolean(api?.sch_PrimitiveComponent?.getAll),
+      getComponentPins: Boolean(api?.sch_PrimitiveComponent?.getAllPinsByPrimitiveId),
       getNetlist: Boolean(api?.sch_Netlist?.getNetlist),
       schDrc: Boolean(api?.sch_Drc?.check),
+      clearPage: Boolean(api?.sch_PrimitiveComponent?.delete || api?.sch_PrimitiveWire?.delete || api?.sch_PrimitiveText?.delete),
+      save: Boolean(api?.sch_Document?.save),
+      createComponent: Boolean(api?.sch_PrimitiveComponent?.create),
+      createWire: Boolean(api?.sch_PrimitiveWire?.create),
+      createNetFlag: Boolean(api?.sch_PrimitiveComponent?.createNetFlag),
+      createNetPort: Boolean(api?.sch_PrimitiveComponent?.createNetPort),
+      createText: Boolean(api?.sch_PrimitiveText?.create),
       createPcbComponent: Boolean(api?.pcb_PrimitiveComponent?.create),
+    },
+    library: {
+      searchDevices: Boolean(api?.lib_Device?.search),
+      getDevicesByLcsc: Boolean(api?.lib_Device?.getByLcscIds),
     },
   };
 }
@@ -2279,17 +2780,59 @@ async function executeCommand(cmd: BridgeCommand): Promise<BridgeResult> {
       case 'get_board_info':
         data = await getBoardInfo();
         break;
+      case 'get_eda_context':
+        data = await getEdaContext(cmd.params);
+        break;
+      case 'invoke_eda_api':
+        data = await invokeEdaApi(cmd.params);
+        break;
       case 'open_document':
         data = await openDocument(cmd.params);
         break;
       case 'get_schematic_state':
         data = await getSchematicState();
         break;
+      case 'read_schematic':
+        data = await readSchematic();
+        break;
+      case 'review_schematic':
+        data = await reviewSchematic();
+        break;
+      case 'save_schematic':
+        data = await saveSchematic();
+        break;
+      case 'clear_schematic_page':
+        data = await clearSchematicPage(cmd.params);
+        break;
+      case 'get_schematic_component_pins':
+        data = await getSchematicComponentPins(cmd.params);
+        break;
       case 'get_netlist':
         data = await getNetlist(cmd.params);
         break;
       case 'run_sch_drc':
         data = await runSchDrc(cmd.params);
+        break;
+      case 'search_library_devices':
+        data = await searchLibraryDevices(cmd.params);
+        break;
+      case 'get_library_devices_by_lcsc':
+        data = await getLibraryDevicesByLcsc(cmd.params);
+        break;
+      case 'create_schematic_component':
+        data = await createSchematicComponent(cmd.params);
+        break;
+      case 'create_schematic_wire':
+        data = await createSchematicWire(cmd.params);
+        break;
+      case 'create_schematic_net_flag':
+        data = await createSchematicNetFlag(cmd.params);
+        break;
+      case 'create_schematic_net_port':
+        data = await createSchematicNetPort(cmd.params);
+        break;
+      case 'create_schematic_text':
+        data = await createSchematicText(cmd.params);
         break;
       case 'create_pcb_component':
         data = await createPcbComponent(cmd.params);
@@ -2458,6 +3001,11 @@ async function handleWsMessage(raw: string): Promise<void> {
     return;
   }
 
+  if (msg?.type === 'hello_ack') {
+    log('ws hello acknowledged by relay');
+    return;
+  }
+
   // Handle command — support both flat and payload-wrapped formats
   if (msg?.type === 'command') {
     const action = msg.action ?? msg.payload?.action;
@@ -2525,6 +3073,7 @@ async function connectWebSocket(): Promise<boolean> {
             stopIntervals();
             log('ws connected via sys_WebSocket, file polling stopped');
             wsSend({ type: 'hello', name: APP_NAME, version: APP_VERSION });
+            setTimeout(() => wsSend({ type: 'hello', name: APP_NAME, version: APP_VERSION }), 500);
             resolve(true);
           },
         );
@@ -2558,6 +3107,7 @@ async function connectWebSocket(): Promise<boolean> {
         log('ws connected via native WebSocket, file polling stopped');
 
         wsSend({ type: 'hello', name: APP_NAME, version: APP_VERSION });
+        setTimeout(() => wsSend({ type: 'hello', name: APP_NAME, version: APP_VERSION }), 500);
         resolve(true);
       };
 
@@ -2749,16 +3299,11 @@ export function activate(_status?: 'onStartupFinished', _arg?: string): void {
 
     log(`plugin loaded (v${APP_VERSION})`);
 
-    if (readEnabledPref()) {
-      try {
-        await startPolling(true);
-        log('bridge auto-restored to running state');
-      } catch (error) {
-        showError('Auto-restore bridge failed', error);
-      }
-    } else {
-      stopIntervals();
-      bridgeEnabled = false;
+    try {
+      await startPolling(true);
+      log(readEnabledPref() ? 'bridge auto-restored to running state' : 'bridge auto-started');
+    } catch (error) {
+      showError('Auto-start bridge failed', error);
     }
   })();
 }

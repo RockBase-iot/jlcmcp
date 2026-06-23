@@ -1,264 +1,209 @@
-# jlceda-mcp-server
-# 本项目上传的文件完全由opus4.6完成，有问题请问agent
-嘉立创 EDA MCP Server — 让 AI 编程助手直接操控嘉立创 EDA 的 PCB 自动化工具集。
+# jlcmcp
 
-通过 [Model Context Protocol](https://modelcontextprotocol.io/) 暴露 39 个 PCB/原理图工具，在 Claude Code / Cursor / Windsurf 等 AI IDE 中直接执行元件移动、走线、铺铜、DRC 等操作。内置 PCB Agent 可自主编排多步操作完成复杂任务。
+`jlcmcp` is a local MCP toolchain for controlling 嘉立创EDA from Codex or any MCP client.
 
-## 架构
-
+```text
+Codex / MCP client
+  -> node dist/index.js
+  -> relay.js at ws://127.0.0.1:18800/ws/bridge
+  -> jlc-bridge EasyEDA extension
+  -> 嘉立创EDA editor
 ```
-AI IDE ──stdio──> mcp-server ──WebSocket──> gateway ──> jlc-bridge 插件 ──> 嘉立创 EDA
-```
 
-MCP server 通过 stdio 与 AI IDE 通信，内部维护 WebSocket 连接到 gateway 的 `/ws/bridge` 端点，转发命令给 jlc-bridge 插件控制 EDA 编辑器。
+The project contains:
 
-本仓库包含两个组件：
-- `src/` — MCP Server（Node.js，39 个 PCB/原理图工具 + Agent）
-- `jlc-bridge/` — 嘉立创 EDA 扩展插件（运行在 EDA 内部，执行实际操作）
+- `src/`: the MCP server exposed over stdio.
+- `relay.js`: the local WebSocket relay used by both the MCP server and the EasyEDA extension.
+- `jlc-bridge/`: the EasyEDA extension packaged as `.eext` / `.lcex`.
 
-## 前置条件
+## Requirements
 
-- Node.js >= 18
-- gateway 运行中（默认端口 18800）
-- jlc-bridge 插件已连接嘉立创 EDA
+- Node.js 18+
+- 嘉立创EDA desktop client with extension support
+- The `jlc-bridge` extension installed and enabled in 嘉立创EDA
 
-## 安装 & 构建
+## Build
 
 ```bash
 npm install
 npm run build
+
+cd jlc-bridge
+npm install
+npm run build
 ```
 
-## 配置
+The extension package is generated at:
 
-在你的项目目录下创建 `.mcp.json`：
+```text
+D:\github\jlcmcp\jlc-bridge\build\jlc-bridge.eext
+```
+
+Install this file in 嘉立创EDA Extension Manager, then restart or reload the extension.
+
+## Start Relay
+
+Run the relay in a separate terminal before using MCP tools:
+
+```bash
+npm run relay
+```
+
+Expected log:
+
+```text
+relay listening on ws://127.0.0.1:18800/ws/bridge
+bridge connected: JLC Bridge 0.1.15
+```
+
+Relay environment variables:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `RELAY_HOST` | `127.0.0.1` | Relay host |
+| `RELAY_PORT` | `18800` | Relay port |
+| `RELAY_PATH` | `/ws/bridge` | WebSocket path |
+| `RELAY_HEARTBEAT_MS` | `30000` | Bridge heartbeat interval |
+
+## Codex MCP Config
+
+Add this to your Codex MCP configuration:
 
 ```json
 {
   "mcpServers": {
     "jlceda": {
       "command": "node",
-      "args": ["<path-to>/jlceda-mcp-server/dist/index.js"],
+      "args": ["<path-to>/jlcmcp/dist/index.js"],
       "env": {
-        "GATEWAY_WS_URL": "ws://127.0.0.1:18800/ws/bridge",
-        "ANTHROPIC_API_KEY": "sk-ant-..."
+        "GATEWAY_WS_URL": "ws://127.0.0.1:18800/ws/bridge"
       }
     }
   }
 }
 ```
 
-配置完成后重启 AI IDE，即可在对话中使用所有工具。
+After changing the config, restart Codex or reload the MCP server.
 
-## 环境变量
+## Useful Checks
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `GATEWAY_WS_URL` | `ws://127.0.0.1:18800/ws/bridge` | Gateway WebSocket 地址 |
-| `ANTHROPIC_API_KEY` | — | Anthropic API Key（设置后启用 pcb_agent 工具） |
-| `AGENT_MODEL` | `claude-sonnet-4-20250514` | Agent 使用的模型 |
+List tools without needing 嘉立创EDA:
 
-## 工具清单 (39 个)
-
-### 状态查询 (9)
-
-| 工具 | 说明 |
-|------|------|
-| `pcb_get_state` | 获取 PCB 完整状态（元件、网络、板框） |
-| `pcb_screenshot` | 截取编辑器截图（base64 PNG） |
-| `pcb_run_drc` | 运行 PCB 设计规则检查 |
-| `pcb_get_tracks` | 查询走线段，可按网络/层过滤 |
-| `pcb_get_pads` | 查询焊盘信息，可按位号过滤 |
-| `pcb_get_net_primitives` | 查询指定网络的所有图元 |
-| `pcb_get_board_info` | 获取工程信息 |
-| `pcb_get_feature_support` | 查询 bridge 支持的功能列表 |
-| `pcb_ping` | 检查 bridge 连接状态 |
-
-### 元件操作 (6)
-
-| 工具 | 说明 |
-|------|------|
-| `pcb_move_component` | 移动元件到指定坐标 |
-| `pcb_relocate_component` | 安全搬迁元件（自动断开走线） |
-| `pcb_batch_move` | 批量移动多个元件 |
-| `pcb_select_component` | 在编辑器中选中元件 |
-| `pcb_delete_selected` | 删除当前选中的对象 |
-| `pcb_create_component` | 从库中放置元件到 PCB |
-
-### 走线 / 过孔 (4)
-
-| 工具 | 说明 |
-|------|------|
-| `pcb_route_track` | 画走线（指定网络、路径点、层、线宽） |
-| `pcb_create_via` | 创建过孔 |
-| `pcb_delete_tracks` | 删除走线 |
-| `pcb_delete_via` | 删除过孔 |
-
-### 铺铜 / 禁布区 (4)
-
-| 工具 | 说明 |
-|------|------|
-| `pcb_create_copper_pour` | 创建矩形铺铜区域 |
-| `pcb_delete_pour` | 删除铺铜 |
-| `pcb_create_keepout` | 创建矩形禁布区 |
-| `pcb_delete_keepout` | 删除禁布区 |
-
-### 丝印 (3)
-
-| 工具 | 说明 |
-|------|------|
-| `pcb_get_silkscreens` | 查询所有丝印文字 |
-| `pcb_move_silkscreen` | 移动丝印 |
-| `pcb_auto_silkscreen` | 自动排列丝印（避免重叠） |
-
-### 高级约束 (6)
-
-| 工具 | 说明 |
-|------|------|
-| `pcb_create_diff_pair` | 创建差分对 |
-| `pcb_list_diff_pairs` | 列出所有差分对 |
-| `pcb_delete_diff_pair` | 删除差分对 |
-| `pcb_create_equal_length` | 创建等长组 |
-| `pcb_list_equal_lengths` | 列出所有等长组 |
-| `pcb_delete_equal_length` | 删除等长组 |
-
-### 原理图 / 文档 (4)
-
-| 工具 | 说明 |
-|------|------|
-| `sch_get_state` | 读取原理图状态 |
-| `sch_get_netlist` | 导出网表 |
-| `sch_run_drc` | 运行原理图 DRC |
-| `pcb_open_document` | 切换到指定文档（原理图或 PCB） |
-
-### PCB Agent (1)
-
-| 工具 | 说明 |
-|------|------|
-| `pcb_agent` | 智能 Agent — 给出高层任务，自主编排多步操作完成（需 ANTHROPIC_API_KEY） |
-
-### 计算工具 (2)
-
-| 工具 | 说明 |
-|------|------|
-| `calc_impedance` | 计算走线阻抗，或根据目标阻抗反算线宽（微带线/带状线/差分） |
-| `calc_trace_width` | 根据载流要求计算最小走线宽度 (IPC-2221) |
-
-> 所有坐标参数单位为 **mil**（密耳），与嘉立创 EDA bridge 一致。
-
-## 项目结构
-
-```
-├── src/                          # MCP Server 源码
-│   ├── index.ts                  # MCP 入口（stdio transport）
-│   ├── bridge-client.ts          # WebSocket 客户端，连接 gateway bridge
-│   ├── calculators.ts            # 阻抗/线宽纯计算函数
-│   ├── agent.ts                  # PCB Agent 核心（工具注册表 + tool-use 循环）
-│   └── tools/
-│       ├── state.ts              # 状态查询 (7)
-│       ├── components.ts         # 元件操作 (3)
-│       ├── routing.ts            # 走线/过孔 (4)
-│       ├── copper-keepout.ts     # 铺铜/禁布区 (4)
-│       ├── silkscreen.ts         # 丝印 (3)
-│       ├── advanced.ts           # 差分对/等长组 (4)
-│       ├── schematic.ts          # 原理图 (3)
-│       ├── calculators.ts        # 阻抗/线宽计算工具 (2)
-│       └── agent.ts              # PCB Agent 工具注册 (1)
-├── jlc-bridge/                   # 嘉立创 EDA 扩展插件
-│   ├── src/index.ts              # 插件主入口（2700+ 行）
-│   ├── extension.json            # 插件清单
-│   ├── build/pack.js             # 打包脚本（生成 .eext/.lcex）
-│   ├── package.json
-│   └── tsconfig.json
-├── dist/                         # MCP Server 编译输出
-├── package.json
-└── tsconfig.json
+```powershell
+$inputJson = @'
+{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"check","version":"1.0"}},"id":0}
+{"jsonrpc":"2.0","method":"tools/list","id":1}
+'@; $inputJson | node dist/index.js
 ```
 
-## 核心模块
+Check the live bridge:
 
-### bridge-client.ts
+```powershell
+$inputJson = @'
+{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"check","version":"1.0"}},"id":0}
+{"jsonrpc":"2.0","method":"tools/call","params":{"name":"pcb_ping","arguments":{}},"id":1}
+{"jsonrpc":"2.0","method":"tools/call","params":{"name":"eda_context","arguments":{}},"id":2}
+'@; $inputJson | node dist/index.js
+```
 
-WebSocket 客户端，连接 gateway `/ws/bridge`。
+## Tool Groups
 
-- 协议：发送 `{type:'command', id, timestamp, payload:{action, params}}`，接收 `{type:'result', payload:{commandId, success, data, error}}`
-- 命令超时 60 秒
-- 断线自动重连（3 秒间隔）
-- 懒连接：首次调用 `command()` 时才建立 WebSocket
+### General EDA/API Tools
 
-### agent.ts
+These tools are inspired by the workflow in [sengbin/JLCEDA-MCP](https://github.com/sengbin/JLCEDA-MCP) and adapted to this repo's relay/bridge protocol.
 
-PCB 智能 Agent 核心，基于 Anthropic Claude API 的 tool-use 循环。
+| Tool | Purpose |
+| --- | --- |
+| `eda_context` | Read current project, active document, current schematic/PCB page, and selected primitive ids |
+| `api_index` | List curated EasyEDA API entries useful for planning |
+| `api_search` | Search curated API signatures before using raw invocation |
+| `api_invoke` | Invoke a verified `eda.*` API path through the bridge |
 
-- 工具注册表：将 28 个 bridge 动作映射为 Anthropic tool-use 格式
-- Agent 循环：system prompt → messages.create → 执行 tool_use → 追加 tool_result → 继续循环
-- 最大轮次限制（默认 20），防止无限循环
-- 收集每步执行日志，最终一起返回
-- 零额外基础设施，纯 `@anthropic-ai/sdk` 实现
+Use `api_search` before `api_invoke`; do not guess method signatures.
 
-### jlc-bridge 插件
+### Schematic Tools
 
-运行在嘉立创 EDA 内部的扩展插件，负责执行实际的 PCB/原理图操作。
+| Tool | Purpose |
+| --- | --- |
+| `schematic_read` | Read a semantic snapshot of the current schematic page |
+| `schematic_review` | Read project-wide schematic/page metadata plus current-page snapshot |
+| `sch_get_state` | Read schematic components, pins, and wires |
+| `sch_get_component_pins` | Read all pins for a component primitive id |
+| `sch_get_netlist` | Export schematic netlist when supported by the current EasyEDA build |
+| `sch_run_drc` | Run schematic DRC |
+| `sch_save` | Save the active schematic document |
+| `sch_clear_page` | Delete schematic primitives from the current page |
+| `sch_create_component` | Place a schematic component by library UUID and device UUID |
+| `sch_create_wire` | Create schematic wires |
+| `sch_create_net_flag` | Create power or ground net flags |
+| `sch_create_net_port` | Create IN/OUT/BI net ports |
+| `sch_create_text` | Add schematic text |
+| `lib_search_devices` | Search EasyEDA/LCSC devices |
+| `lib_get_devices_by_lcsc` | Resolve devices by LCSC C number |
+| `pcb_open_document` | Open a document by UUID |
 
-- 通过 WebSocket 连接 gateway，接收并执行命令
-- 支持文件轮询回退（当 WebSocket 不可用时）
-- 50+ 个底层操作函数（元件移动、走线、铺铜、DRC 等）
-- 打包为 `.eext` / `.lcex` 格式，在嘉立创 EDA 扩展管理器中安装
+Schematic coordinates use EasyEDA schematic units: `1 unit = 0.01 inch`.
 
-构建插件：
+### PCB Tools
+
+| Group | Tools |
+| --- | --- |
+| State | `pcb_get_state`, `pcb_screenshot`, `pcb_run_drc`, `pcb_get_tracks`, `pcb_get_pads`, `pcb_get_net_primitives`, `pcb_get_board_info`, `pcb_get_feature_support`, `pcb_ping` |
+| Components | `pcb_move_component`, `pcb_relocate_component`, `pcb_batch_move`, `pcb_select_component`, `pcb_delete_selected`, `pcb_create_component` |
+| Routing | `pcb_route_track`, `pcb_create_via`, `pcb_delete_tracks`, `pcb_delete_via` |
+| Copper/keepout | `pcb_create_copper_pour`, `pcb_delete_pour`, `pcb_create_keepout`, `pcb_delete_keepout` |
+| Silkscreen | `pcb_get_silkscreens`, `pcb_move_silkscreen`, `pcb_auto_silkscreen` |
+| Constraints | `pcb_create_diff_pair`, `pcb_list_diff_pairs`, `pcb_delete_diff_pair`, `pcb_create_equal_length`, `pcb_list_equal_lengths`, `pcb_delete_equal_length` |
+| Calculators | `calc_impedance`, `calc_trace_width` |
+
+PCB coordinates use mil units.
+
+## Extension Notes
+
+`jlc-bridge` version `0.1.15` supports:
+
+- WebSocket-first transport through `sys_WebSocket` or native WebSocket.
+- File polling fallback when WebSocket is unavailable.
+- Auto-start on extension activation.
+- Menu registration on schematic and PCB pages.
+- EasyEDA v3-compatible `engines.eda` range.
+
+## Troubleshooting
+
+If `pcb_ping` times out:
+
+1. Confirm `npm run relay` is running.
+2. Confirm relay logs show `bridge connected`.
+3. In 嘉立创EDA, open the extension manager and make sure `JLC Bridge` is installed and enabled.
+4. If port `18800` is occupied by a stale relay, close the old Node process and start `npm run relay` again.
+5. Reinstall `jlc-bridge/build/jlc-bridge.eext` after bridge source changes.
+
+If schematic creation succeeds but DRC fails:
+
+- Use `sch_get_component_pins` after placing components.
+- Wire to actual pin coordinates with `sch_create_wire`.
+- Use net ports/flags only as labels for the intended net.
+
+## Development
+
+Main files:
+
+```text
+src/index.ts                  MCP server entry
+src/bridge-client.ts          WebSocket client for relay.js
+src/tools/*.ts                MCP tool registrations
+relay.js                      WebSocket relay
+jlc-bridge/src/index.ts       EasyEDA extension runtime
+jlc-bridge/extension.json     EasyEDA extension manifest
+```
+
+Build both sides before reinstalling the extension:
 
 ```bash
-cd jlc-bridge
-npm install
-npm run build    # 编译 + 打包为 .eext
-```
-
-## 使用示例
-
-在 AI IDE 中直接用自然语言：
-
-```
-> 获取当前 PCB 状态
-  → 调用 pcb_get_state
-
-> 把 U1 移到 (1000, 2000)
-  → 调用 pcb_move_component {designator:"U1", x:1000, y:2000}
-
-> 运行 DRC 检查
-  → 调用 pcb_run_drc
-
-> 在 GND 网络顶层铺铜，范围 (0,0) 到 (2000,4000)
-  → 调用 pcb_create_copper_pour {net:"GND", layer:1, x1:0, y1:0, x2:2000, y2:4000}
-
-> 创建 USB 差分对
-  → 调用 pcb_create_diff_pair {name:"USB", posNet:"USB_DP", negNet:"USB_DN"}
-
-> 分析当前布局并给出优化建议
-  → 调用 pcb_agent {task:"分析当前布局并给出优化建议"}
-  → Agent 自主调用 get_state → 分析 → 给出建议
-```
-
-## 验证
-
-```bash
-# 编译
 npm run build
-
-# 测试 MCP 协议（不需要 gateway）
-echo '{"jsonrpc":"2.0","method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}},"id":0}
-{"jsonrpc":"2.0","method":"tools/list","id":1}' | node dist/index.js
-
-# 端到端测试（需要 gateway + jlc-bridge 运行）
-# 在 AI IDE 中说 "获取当前 PCB 状态" 即可验证
+cd jlc-bridge
+npm run build
 ```
-
-## 技术栈
-
-- TypeScript 5.7, ES2022 modules
-- [@modelcontextprotocol/sdk](https://www.npmjs.com/package/@modelcontextprotocol/sdk) ^1.12 — MCP 协议实现
-- [@anthropic-ai/sdk](https://www.npmjs.com/package/@anthropic-ai/sdk) ^0.39 — Claude API（Agent tool-use 循环）
-- [ws](https://www.npmjs.com/package/ws) ^8 — WebSocket 客户端
-- [zod](https://www.npmjs.com/package/zod) ^3.23 — 工具参数 schema 定义
 
 ## License
 

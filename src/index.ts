@@ -10,6 +10,7 @@ import { registerAdvancedTools } from './tools/advanced.js';
 import { registerSchematicTools } from './tools/schematic.js';
 import { registerAgentTools } from './tools/agent.js';
 import { registerCalculatorTools } from './tools/calculators.js';
+import { registerApiTools } from './tools/api.js';
 
 async function main() {
   const bridge = new BridgeClient();
@@ -27,6 +28,7 @@ async function main() {
   registerSilkscreenTools(server, bridge);
   registerAdvancedTools(server, bridge);
   registerSchematicTools(server, bridge);
+  registerApiTools(server, bridge);
   registerAgentTools(server, bridge);
   registerCalculatorTools(server);
 

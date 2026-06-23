@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "jlceda": {
+      "command": "node",
+      "args": [
+        "D:/github/jlcmcp/dist/index.js"
+      ],
+      "env": {
+        "GATEWAY_WS_URL": "ws://127.0.0.1:18800/ws/bridge"
+      }
+    }
+  }
+}
