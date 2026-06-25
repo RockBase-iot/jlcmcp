@@ -106,6 +106,28 @@ $inputJson = @'
 '@; $inputJson | node dist/index.js
 ```
 
+## Reusable Scripts
+
+Top-level JavaScript utilities in `scripts/` are reusable project tooling:
+
+| Script | Purpose |
+| --- | --- |
+| `scripts/inspect-eda-project.js` | Print current project, board, schematic, PCB, and page metadata |
+| `scripts/inspect-pcb-pads.js` | Print PCB components and their actual pad numbers/positions/nets |
+| `scripts/inspect-schematic-pins.js` | Print schematic components and actual pin numbers/positions |
+| `scripts/sync-pcb-from-schematic.js` | Run PCB import-changes from the board-linked schematic |
+| `scripts/parse-gerber-dimensions.js` | Parse board outline and drill dimensions from an extracted Gerber directory |
+
+Shared code belongs in `scripts/lib/`. Board-specific scripts, pin maps, one-off layout experiments, generated Gerbers, and downloaded reference material belong under `designs/<project>/`; `designs/` is intentionally ignored by git.
+
+Example board-local layout:
+
+```text
+designs/control-button-panel/scripts/
+```
+
+When a board-local script becomes useful for other boards, move the reusable helper into `scripts/lib/` and keep only the board-specific configuration in `designs/<project>/scripts/`.
+
 ## Tool Groups
 
 ### General EDA/API Tools
